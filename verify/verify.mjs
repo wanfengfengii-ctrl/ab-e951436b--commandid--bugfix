@@ -242,6 +242,157 @@ async function main() {
     check('re-upload revives and promotes to 2', reup.json.highWatermark === 2 && reup.json.conflicts.length === 0);
   });
 
+  await group('global commandId idempotency across admin command kinds', async () => {
+    const dg = 'acc-global-' + Math.random().toString(36).slice(2, 8);
+    const sg = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: dg, publicKey: sg.publicB64Url } });
+    const cg = chain(sg, dg, 3);
+
+    // Divergent conflict at seq 3 while 1..2 are still missing.
+    const fork3 = sg.event({ ...cg[2].event, payload: { fork: true } });
+    await api('POST', `/v1/devices/${dg}/ingest`, { body: { requestId: rid(), events: [fork3.event] } });
+    const pre = await api('POST', `/v1/devices/${dg}/ingest`, { body: { requestId: rid(), events: [cg[2].event] } });
+    const revision = pre.json.conflicts[0].revision;
+    await api('POST', `/v1/devices/${dg}/ingest`, { body: { requestId: rid(), events: [cg[0].event, cg[1].event] } });
+
+    const sharedId = 'gcmd-' + rid();
+    const adjBody = {
+      deviceId: dg, sequence: 3, commandId: sharedId,
+      expectedConflictRevision: revision,
+      decision: { type: 'select', digest: cg[2].digest },
+    };
+    const adj = await api('POST', `/v1/devices/${dg}/conflicts/3/adjudicate`, { admin: true, body: adjBody });
+    check('adjudication succeeds and owns the commandId', adj.status === 200 && adj.json.highWatermark === 3);
+
+    // Identical content replays the exact first result.
+    const adjReplay = await api('POST', `/v1/devices/${dg}/conflicts/3/adjudicate`, { admin: true, body: adjBody });
+    check('identical adjudication replays the first result',
+      adjReplay.status === 200 && adjReplay.json.replayed === true &&
+      adjReplay.json.chosenDigest === adj.json.chosenDigest);
+
+    // Reuse the adjudicate commandId for a (legal, different) rotation.
+    const newKey = new Signer();
+    const rotBody = {
+      deviceId: dg, commandId: sharedId, keyVersion: 2, effectiveSequence: 5,
+      expectedControlRevision: 1, publicKey: newKey.publicB64Url,
+    };
+    const reuse = await api('POST', `/v1/devices/${dg}/keys/rotate`, { admin: true, body: rotBody });
+    check('cross-kind reuse after adjudicate is a structured 409',
+      reuse.status === 409 && reuse.json.error.code === 'IDEMPOTENCY_CONFLICT' &&
+      reuse.json.error.details.firstKind === 'adjudicate' &&
+      reuse.json.error.details.attemptedKind === 'rotate');
+    const reuseAgain = await api('POST', `/v1/devices/${dg}/keys/rotate`, { admin: true, body: rotBody });
+    check('the cross-kind conflict is stable on repeat', reuseAgain.status === 409);
+
+    const stateAfterReject = await api('GET', `/v1/devices/${dg}`);
+    check('rejected cross-kind rotation leaves no partial rotation',
+      stateAfterReject.json.controlRevision === 1 && stateAfterReject.json.keys.length === 1);
+
+    // A fresh commandId lets the device version advance normally.
+    const rotId = 'grot-' + rid();
+    const realRotBody = { ...rotBody, commandId: rotId };
+    const rot = await api('POST', `/v1/devices/${dg}/keys/rotate`, { admin: true, body: realRotBody });
+    check('rotation with a fresh commandId advances the device version',
+      rot.status === 200 && rot.json.controlRevision === 2);
+    const rotReplay = await api('POST', `/v1/devices/${dg}/keys/rotate`, { admin: true, body: realRotBody });
+    check('identical rotation replays the first result',
+      rotReplay.status === 200 && rotReplay.json.replayed === true && rotReplay.json.controlRevision === 2);
+    const rotDiff = await api('POST', `/v1/devices/${dg}/keys/rotate`, {
+      admin: true, body: { ...realRotBody, publicKey: new Signer().publicB64Url },
+    });
+    check('same rotation commandId with different content is 409',
+      rotDiff.status === 409 && rotDiff.json.error.code === 'IDEMPOTENCY_CONFLICT');
+
+    // Manual compaction participates in the same global reservation.
+    const cpId = 'gcp-' + rid();
+    const cpBody = { deviceId: dg, commandId: cpId, cutoffSequence: 2 };
+    const cp = await api('POST', '/v1/admin/compact', { admin: true, body: cpBody });
+    check('manual compaction owns its commandId', cp.status === 200 && cp.json.checkpoint.sequence === 2);
+    const cpReplay = await api('POST', '/v1/admin/compact', { admin: true, body: cpBody });
+    check('identical compaction replays', cpReplay.status === 200 && cpReplay.json.replayed === true);
+    const cpDiff = await api('POST', '/v1/admin/compact', {
+      admin: true, body: { ...cpBody, cutoffSequence: 3 },
+    });
+    check('same compaction commandId different content is 409',
+      cpDiff.status === 409 && cpDiff.json.error.code === 'IDEMPOTENCY_CONFLICT');
+    const cpAfterAdj = await api('POST', '/v1/admin/compact', {
+      admin: true, body: { deviceId: dg, commandId: sharedId, cutoffSequence: 3 },
+    });
+    check('reusing an adjudicate commandId for compaction is 409', cpAfterAdj.status === 409);
+    const rotAfterCp = await api('POST', `/v1/devices/${dg}/keys/rotate`, {
+      admin: true,
+      body: {
+        deviceId: dg, commandId: cpId, keyVersion: 3, effectiveSequence: 9,
+        expectedControlRevision: 2, publicKey: new Signer().publicB64Url,
+      },
+    });
+    check('reusing a compaction commandId for rotation is 409', rotAfterCp.status === 409);
+
+    // Final state is exactly: one adjudication, two key generations, one checkpoint.
+    const finalState = await api('GET', `/v1/devices/${dg}`);
+    check('device version advanced exactly once',
+      finalState.json.controlRevision === 2 && finalState.json.keys.length === 2);
+  });
+
+  await group('concurrent commandId contention across the two API instances', async () => {
+    const da = 'acc-ra-' + Math.random().toString(36).slice(2, 8);
+    const db = 'acc-rb-' + Math.random().toString(36).slice(2, 8);
+    const sa = new Signer();
+    const sb = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: da, publicKey: sa.publicB64Url } });
+    await api('POST', '/v1/devices', { body: { deviceId: db, publicKey: sb.publicB64Url } });
+
+    // Open conflict on device A.
+    const ca = chain(sa, da, 3);
+    const fork3 = sa.event({ ...ca[2].event, payload: { fork: true } });
+    await api('POST', `/v1/devices/${da}/ingest`, { body: { requestId: rid(), events: [fork3.event] } });
+    const pre = await api('POST', `/v1/devices/${da}/ingest`, { body: { requestId: rid(), events: [ca[2].event] } });
+    const revision = pre.json.conflicts[0].revision;
+    await api('POST', `/v1/devices/${da}/ingest`, { body: { requestId: rid(), events: [ca[0].event, ca[1].event] } });
+
+    const raceId = 'race-' + rid();
+    const adjBody = {
+      deviceId: da, sequence: 3, commandId: raceId,
+      expectedConflictRevision: revision,
+      decision: { type: 'select', digest: ca[2].digest },
+    };
+    const rotBody = {
+      deviceId: db, commandId: raceId, keyVersion: 2, effectiveSequence: 4,
+      expectedControlRevision: 1, publicKey: new Signer().publicB64Url,
+    };
+
+    // Issued together; the round-robin proxy spreads them across api1/api2.
+    const [ar, rr] = await Promise.all([
+      api('POST', `/v1/devices/${da}/conflicts/3/adjudicate`, { admin: true, body: adjBody }),
+      api('POST', `/v1/devices/${db}/keys/rotate`, { admin: true, body: rotBody }),
+    ]);
+    const statuses = [ar.status, rr.status].sort((x, y) => x - y);
+    check('exactly one first result is produced', statuses.join(',') === '200,409');
+    const loser = ar.status === 409 ? ar : rr;
+    check('the loser gets a structured idempotency conflict',
+      loser.status === 409 && loser.json.error.code === 'IDEMPOTENCY_CONFLICT');
+
+    const confA = await api('GET', `/v1/devices/${da}/conflicts/3`);
+    const stateB = await api('GET', `/v1/devices/${db}`);
+    if (ar.status === 200) {
+      check('winning adjudication resolved the conflict', confA.json.status === 'resolved');
+      check('losing rotation left no partial rotation',
+        stateB.json.controlRevision === 1 && stateB.json.keys.length === 1);
+    } else {
+      check('losing adjudication left the conflict open', confA.json.status === 'open');
+      const stateA = await api('GET', `/v1/devices/${da}`);
+      check('losing adjudication left the watermark at 2', stateA.json.highWatermark === 2);
+      check('winning rotation advanced the device version',
+        stateB.json.controlRevision === 2 && stateB.json.keys.length === 2);
+    }
+
+    // The losing request stays a stable conflict on replay.
+    const retry = ar.status === 409
+      ? await api('POST', `/v1/devices/${da}/conflicts/3/adjudicate`, { admin: true, body: adjBody })
+      : await api('POST', `/v1/devices/${db}/keys/rotate`, { admin: true, body: rotBody });
+    check('the losing request remains a stable 409', retry.status === 409);
+  });
+
   await group('long-poll wait', async () => {
     const d7 = 'acc-wait-' + Math.random().toString(36).slice(2, 8);
     const s7 = new Signer();
