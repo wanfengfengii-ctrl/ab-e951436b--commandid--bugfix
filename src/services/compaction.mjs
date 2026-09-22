@@ -20,6 +20,7 @@ import { errors } from '../errors.mjs';
 import { canonicalCheckpoint, signCheckpoint } from '../crypto/checkpoint.mjs';
 import { digestHex } from '../crypto/envelope.js';
 import { canonicalize } from '../crypto/canonical.js';
+import { runIdempotentAdminCommand } from './idempotency.mjs';
 
 // Stable 64-bit advisory-lock key derived from a device id string.
 function lockKey(deviceId) {
@@ -42,25 +43,8 @@ export async function compactDevice(pool, serverKey, cfg, deviceId, desiredCutof
   const requestHash = digestHex(
     canonicalize({ kind: 'compact', deviceId, cutoffSequence: desiredCutoff })
   );
-  return withTransaction(pool, async (client) => {
-    if (commandId !== null) {
-      const replay = await client.query(
-        'SELECT request_hash, response FROM admin_commands WHERE command_id=$1 AND kind=$2',
-        [commandId, 'compact']
-      );
-      if (replay.rows.length) {
-        const r = replay.rows[0];
-        if (r.request_hash !== requestHash) {
-          throw errors.conflict(
-            'IDEMPOTENCY_CONFLICT',
-            `commandId ${commandId} was already used with different parameters`,
-            { commandId }
-          );
-        }
-        return { ...r.response, replayed: true };
-      }
-    }
 
+  const execute = async (client) => {
     const gotLock = await client.query('SELECT pg_try_advisory_xact_lock($1) AS ok', [lockKey(deviceId)]);
     if (!gotLock.rows[0].ok) return null; // another compaction is running
 
@@ -95,15 +79,7 @@ export async function compactDevice(pool, serverKey, cfg, deviceId, desiredCutof
       cutoff = desiredCutoff;
       if (cutoff <= prevSeq) {
         // Idempotent: an equal-or-later checkpoint already covers this request.
-        const skipped = { deviceId, skipped: true, latestCheckpointSequence: prevSeq };
-        if (commandId !== null) {
-          await client.query(
-            `INSERT INTO admin_commands (command_id, device_id, kind, request_hash, conflict, response)
-             VALUES ($1,$2,'compact',$3,false,$4)`,
-            [commandId, deviceId, requestHash, JSON.stringify(skipped)]
-          );
-        }
-        return skipped;
+        return { deviceId, skipped: true, latestCheckpointSequence: prevSeq };
       }
     }
 
@@ -177,22 +153,25 @@ export async function compactDevice(pool, serverKey, cfg, deviceId, desiredCutof
       ...cp,
       signerPublicKey: serverKey.publicB64Url,
     };
-    const result = {
+    return {
       deviceId,
       checkpoint,
       deletedEvents: deleted.rowCount,
       retainedEvents: hwm - safeCutoff,
     };
+  };
 
-    if (commandId !== null) {
-      await client.query(
-        `INSERT INTO admin_commands (command_id, device_id, kind, request_hash, conflict, response)
-         VALUES ($1,$2,'compact',$3,false,$4)`,
-        [commandId, deviceId, requestHash, JSON.stringify(result)]
-      );
-    }
-    return result;
-  });
+  // Background/policy compaction carries no idempotency token; manual
+  // compaction participates in the GLOBAL commandId reservation shared with
+  // every other admin command type.
+  if (commandId === null) {
+    return withTransaction(pool, execute);
+  }
+  return runIdempotentAdminCommand(
+    pool,
+    { commandId, kind: 'compact', deviceId, requestHash },
+    execute
+  );
 }
 
 /** One background pass: expire views and checkpoint eligible devices. */

@@ -8,6 +8,7 @@ import { errors } from '../errors.mjs';
 import { digestHex } from '../crypto/envelope.js';
 import { canonicalize } from '../crypto/canonical.js';
 import { encodeB64Url } from '../crypto/keys.js';
+import { runIdempotentAdminCommand } from './idempotency.mjs';
 
 function keyRowToApi(row) {
   return {
@@ -78,112 +79,94 @@ export async function rotateKey(pool, cmd) {
   // NOTE: the public key is part of the command content too.
   const fullHash = digestHex(Buffer.concat([Buffer.from(requestHash, 'hex'), publicKeyRaw]));
 
-  return withTransaction(pool, async (client) => {
-    const replay = await client.query(
-      'SELECT request_hash, conflict, response FROM admin_commands WHERE command_id=$1 AND kind=$2',
-      [commandId, 'rotate']
-    );
-    if (replay.rows.length) {
-      const r = replay.rows[0];
-      if (r.request_hash !== fullHash) {
+  return runIdempotentAdminCommand(
+    pool,
+    { commandId, kind: 'rotate', deviceId, requestHash: fullHash },
+    async (client) => {
+      const dev = await client.query(
+        'SELECT high_watermark, control_revision FROM devices WHERE device_id=$1 FOR UPDATE',
+        [deviceId]
+      );
+      if (dev.rows.length === 0) throw errors.deviceNotFound(deviceId);
+      const hwm = Number(dev.rows[0].high_watermark);
+      const currentRevision = Number(dev.rows[0].control_revision);
+
+      if (currentRevision !== expectedControlRevision) {
         throw errors.conflict(
-          'IDEMPOTENCY_CONFLICT',
-          `commandId ${commandId} was already used with different parameters`,
-          { commandId, deviceId: r.response.deviceId }
+          'CONTROL_REVISION_MISMATCH',
+          `expectedControlRevision ${expectedControlRevision} does not match current revision ${currentRevision}`,
+          { deviceId, currentRevision, expectedControlRevision }
         );
       }
-      return { ...r.response, replayed: true };
-    }
 
-    const dev = await client.query(
-      'SELECT high_watermark, control_revision FROM devices WHERE device_id=$1 FOR UPDATE',
-      [deviceId]
-    );
-    if (dev.rows.length === 0) throw errors.deviceNotFound(deviceId);
-    const hwm = Number(dev.rows[0].high_watermark);
-    const currentRevision = Number(dev.rows[0].control_revision);
+      const keys = await client.query(
+        'SELECT key_version, effective_sequence FROM device_keys WHERE device_id=$1 ORDER BY key_version',
+        [deviceId]
+      );
+      const maxVersion = Number(keys.rows[keys.rows.length - 1].key_version);
+      if (keyVersion !== maxVersion + 1) {
+        throw errors.conflict(
+          'KEY_VERSION_CONFLICT',
+          `keyVersion must be exactly ${maxVersion + 1} (the next generation); reuse and gaps are not allowed`,
+          { deviceId, expectedKeyVersion: maxVersion + 1, providedKeyVersion: keyVersion }
+        );
+      }
+      if (effectiveSequence <= hwm) {
+        throw errors.conflict(
+          'EFFECTIVE_SEQUENCE_NOT_AHEAD_OF_WATERMARK',
+          `effectiveSequence must be strictly greater than the current contiguous watermark ${hwm}`,
+          { deviceId, highWatermark: hwm, effectiveSequence }
+        );
+      }
+      const overlaps = keys.rows.find((r) => Number(r.effective_sequence) === effectiveSequence);
+      if (overlaps) {
+        throw errors.conflict(
+          'OVERLAPPING_EFFECTIVE_RANGE',
+          `effectiveSequence ${effectiveSequence} is already used by keyVersion ${overlaps.key_version}`,
+          { deviceId, effectiveSequence, conflictingKeyVersion: Number(overlaps.key_version) }
+        );
+      }
+      // Deterministic handling of a boundary already occupied by staged events.
+      // Any staged event at or beyond the new effectiveSequence must have been
+      // signed by a key generation that existed before the rotation (i.e. the
+      // old key), which must never be accepted past the boundary. Rejecting the
+      // rotation is the only outcome that does not strand such events into a
+      // later key_generation_invalid conflict; strictly-below events stay valid
+      // under the old key and may still promote.
+      const occupied = await client.query(
+        `SELECT min(sequence) AS s FROM event_records
+          WHERE device_id=$1 AND status='staged' AND sequence >= $2`,
+        [deviceId, effectiveSequence]
+      );
+      if (occupied.rows[0].s !== null) {
+        throw errors.conflict(
+          'ROTATION_BOUNDARY_OCCUPIED',
+          `staged events already exist at or beyond effectiveSequence ${effectiveSequence}; ` +
+            'choose a boundary beyond all staged sequences',
+          { deviceId, effectiveSequence, firstOccupiedSequence: Number(occupied.rows[0].s) }
+        );
+      }
 
-    if (currentRevision !== expectedControlRevision) {
-      throw errors.conflict(
-        'CONTROL_REVISION_MISMATCH',
-        `expectedControlRevision ${expectedControlRevision} does not match current revision ${currentRevision}`,
-        { deviceId, currentRevision, expectedControlRevision }
+      await client.query(
+        `INSERT INTO device_keys (device_id, key_version, public_key, effective_sequence)
+         VALUES ($1, $2, $3, $4)`,
+        [deviceId, keyVersion, publicKeyRaw, effectiveSequence]
       );
-    }
+      const nextRevision = currentRevision + 1;
+      await client.query(
+        'UPDATE devices SET control_revision=$2, updated_at=now() WHERE device_id=$1',
+        [deviceId, nextRevision]
+      );
+      // Promotion cannot cross the new boundary until new-key events arrive, but
+      // old-key events already staged below the boundary may now promote.
+      await client.query('SELECT try_advance($1)', [deviceId]);
 
-    const keys = await client.query(
-      'SELECT key_version, effective_sequence FROM device_keys WHERE device_id=$1 ORDER BY key_version',
-      [deviceId]
-    );
-    const maxVersion = Number(keys.rows[keys.rows.length - 1].key_version);
-    if (keyVersion !== maxVersion + 1) {
-      throw errors.conflict(
-        'KEY_VERSION_CONFLICT',
-        `keyVersion must be exactly ${maxVersion + 1} (the next generation); reuse and gaps are not allowed`,
-        { deviceId, expectedKeyVersion: maxVersion + 1, providedKeyVersion: keyVersion }
-      );
+      return {
+        deviceId, commandId, keyVersion, effectiveSequence,
+        controlRevision: nextRevision,
+      };
     }
-    if (effectiveSequence <= hwm) {
-      throw errors.conflict(
-        'EFFECTIVE_SEQUENCE_NOT_AHEAD_OF_WATERMARK',
-        `effectiveSequence must be strictly greater than the current contiguous watermark ${hwm}`,
-        { deviceId, highWatermark: hwm, effectiveSequence }
-      );
-    }
-    const overlaps = keys.rows.find((r) => Number(r.effective_sequence) === effectiveSequence);
-    if (overlaps) {
-      throw errors.conflict(
-        'OVERLAPPING_EFFECTIVE_RANGE',
-        `effectiveSequence ${effectiveSequence} is already used by keyVersion ${overlaps.key_version}`,
-        { deviceId, effectiveSequence, conflictingKeyVersion: Number(overlaps.key_version) }
-      );
-    }
-    // Deterministic handling of a boundary already occupied by staged events.
-    // Any staged event at or beyond the new effectiveSequence must have been
-    // signed by a key generation that existed before the rotation (i.e. the
-    // old key), which must never be accepted past the boundary. Rejecting the
-    // rotation is the only outcome that does not strand such events into a
-    // later key_generation_invalid conflict; strictly-below events stay valid
-    // under the old key and may still promote.
-    const occupied = await client.query(
-      `SELECT min(sequence) AS s FROM event_records
-        WHERE device_id=$1 AND status='staged' AND sequence >= $2`,
-      [deviceId, effectiveSequence]
-    );
-    if (occupied.rows[0].s !== null) {
-      throw errors.conflict(
-        'ROTATION_BOUNDARY_OCCUPIED',
-        `staged events already exist at or beyond effectiveSequence ${effectiveSequence}; ` +
-          'choose a boundary beyond all staged sequences',
-        { deviceId, effectiveSequence, firstOccupiedSequence: Number(occupied.rows[0].s) }
-      );
-    }
-
-    await client.query(
-      `INSERT INTO device_keys (device_id, key_version, public_key, effective_sequence)
-       VALUES ($1, $2, $3, $4)`,
-      [deviceId, keyVersion, publicKeyRaw, effectiveSequence]
-    );
-    const nextRevision = currentRevision + 1;
-    await client.query(
-      'UPDATE devices SET control_revision=$2, updated_at=now() WHERE device_id=$1',
-      [deviceId, nextRevision]
-    );
-    // Promotion cannot cross the new boundary until new-key events arrive, but
-    // old-key events already staged below the boundary may now promote.
-    await client.query('SELECT try_advance($1)', [deviceId]);
-
-    const response = {
-      deviceId, commandId, keyVersion, effectiveSequence,
-      controlRevision: nextRevision,
-    };
-    await client.query(
-      `INSERT INTO admin_commands (command_id, device_id, kind, request_hash, conflict, response)
-       VALUES ($1,$2,'rotate',$3,false,$4)`,
-      [commandId, deviceId, fullHash, JSON.stringify(response)]
-    );
-    return { ...response, replayed: false };
-  });
+  );
 }
 
 export async function getDevice(pool, deviceId) {
